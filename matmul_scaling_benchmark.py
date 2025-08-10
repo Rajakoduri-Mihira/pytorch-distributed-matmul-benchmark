@@ -23,6 +23,39 @@ def setup_distributed():
         print("Running in single GPU mode")
         return 0, 1
 
+def verify_collectives(rank: int, world_size: int, device: str):
+    """Verify that collective operations are working correctly"""
+    if not dist.is_initialized() or world_size == 1:
+        return True
+    
+    try:
+        # Test all_reduce
+        test_tensor = torch.tensor([rank + 1.0], device=device)
+        dist.all_reduce(test_tensor, op=dist.ReduceOp.SUM)
+        expected_sum = sum(range(1, world_size + 1))
+        if abs(test_tensor.item() - expected_sum) > 0.001:
+            print(f"Rank {rank}: all_reduce failed. Expected {expected_sum}, got {test_tensor.item()}")
+            return False
+        
+        # Test all_gather
+        local_tensor = torch.tensor([rank * 2.0], device=device)
+        gathered = [torch.zeros(1, device=device) for _ in range(world_size)]
+        dist.all_gather(gathered, local_tensor)
+        for i in range(world_size):
+            if abs(gathered[i].item() - i * 2.0) > 0.001:
+                print(f"Rank {rank}: all_gather failed for rank {i}. Expected {i * 2.0}, got {gathered[i].item()}")
+                return False
+        
+        # Test barrier
+        dist.barrier()
+        
+        if rank == 0:
+            print(f"✓ Collective operations verified successfully across {world_size} GPUs")
+        return True
+    except Exception as e:
+        print(f"Rank {rank}: Collective verification failed with error: {e}")
+        return False
+
 def cleanup_distributed():
     if dist.is_initialized():
         dist.destroy_process_group()
@@ -41,10 +74,12 @@ def benchmark_independent(matrix_size: int, dtype: torch.dtype, device: str, ran
     A = torch.randn(matrix_size, matrix_size, dtype=dtype, device=device)
     B = torch.randn(matrix_size, matrix_size, dtype=dtype, device=device)
     
-    # Warmup
+    # Warmup with synchronization
     for _ in range(warmup_iterations):
         C = torch.matmul(A, B)
     torch.cuda.synchronize()
+    if dist.is_initialized():
+        dist.barrier()  # Ensure all GPUs complete warmup
     
     # Benchmark
     start_event = torch.cuda.Event(enable_timing=True)
@@ -80,34 +115,54 @@ def benchmark_batch_parallel(matrix_size: int, batch_size: int, dtype: torch.dty
     A = torch.randn(local_batch_size, matrix_size, matrix_size, dtype=dtype, device=device)
     B = torch.randn(local_batch_size, matrix_size, matrix_size, dtype=dtype, device=device)
     
-    # Warmup
+    # Warmup with synchronization
     for _ in range(warmup_iterations):
         C = torch.bmm(A, B)  # Batched matrix multiply
-        # In real training, we'd do allreduce on gradients here, not on C
-        # But for benchmark, we'll measure the forward pass
-    torch.cuda.synchronize()
-    
-    # Benchmark
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
+        # Simulate gradient allreduce that would happen in real training
+        if dist.is_initialized():
+            # In real training, gradients would be synchronized here
+            # For benchmarking, we'll allreduce the output to measure communication overhead
+            dist.all_reduce(C, op=dist.ReduceOp.SUM)
     
     torch.cuda.synchronize()
-    start_event.record()
+    if dist.is_initialized():
+        dist.barrier()  # Ensure all GPUs are ready
+    
+    # Benchmark with separate timing for compute and communication
+    compute_time = 0.0
+    comm_time = 0.0
     
     for _ in range(num_iterations):
+        # Time compute
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        
+        torch.cuda.synchronize()
+        start_event.record()
         C = torch.bmm(A, B)
+        end_event.record()
+        torch.cuda.synchronize()
+        compute_time += start_event.elapsed_time(end_event)
+        
+        # Time communication (simulating gradient sync)
+        if dist.is_initialized():
+            start_event.record()
+            dist.all_reduce(C, op=dist.ReduceOp.SUM)
+            end_event.record()
+            torch.cuda.synchronize()
+            comm_time += start_event.elapsed_time(end_event)
     
-    end_event.record()
-    torch.cuda.synchronize()
-    
-    total_time_ms = start_event.elapsed_time(end_event)
-    total_time = total_time_ms / 1000.0
-    avg_time = total_time / num_iterations
+    avg_compute_time = (compute_time / 1000.0) / num_iterations
+    avg_comm_time = (comm_time / 1000.0) / num_iterations
+    avg_total_time = avg_compute_time + avg_comm_time
     
     # Each GPU did local_batch_size matmuls per iteration
-    tflops_per_gpu = calculate_tflops(matrix_size, avg_time, num_ops=local_batch_size)
+    tflops_per_gpu = calculate_tflops(matrix_size, avg_total_time, num_ops=local_batch_size)
     
-    return avg_time, tflops_per_gpu
+    if rank == 0 and num_iterations > 0:
+        print(f"    Compute time: {avg_compute_time*1000:.3f} ms, Comm time: {avg_comm_time*1000:.3f} ms")
+    
+    return avg_total_time, tflops_per_gpu
 
 def benchmark_matrix_parallel(matrix_size: int, dtype: torch.dtype, device: str, 
                              rank: int, world_size: int,
@@ -127,18 +182,20 @@ def benchmark_matrix_parallel(matrix_size: int, dtype: torch.dtype, device: str,
     
     B_local = torch.randn(matrix_size, end_col - start_col, dtype=dtype, device=device)
     
-    # Warmup
+    # Warmup with proper synchronization
     for _ in range(warmup_iterations):
         # Local computation
         C_local = torch.matmul(A, B_local)
         
-        # In real scenario, we'd gather C_local from all GPUs
+        # Gather results from all GPUs
         if dist.is_initialized():
             # Allocate space for gather (simplified - in practice would optimize this)
             gathered = [torch.zeros_like(C_local) for _ in range(world_size)]
             dist.all_gather(gathered, C_local)
     
     torch.cuda.synchronize()
+    if dist.is_initialized():
+        dist.barrier()  # Ensure all GPUs complete warmup
     
     # Benchmark
     compute_time = 0.0
@@ -171,10 +228,25 @@ def benchmark_matrix_parallel(matrix_size: int, dtype: torch.dtype, device: str,
     avg_total_time = avg_compute_time + avg_comm_time
     
     # Each GPU does 1/world_size of the total work
-    # But together they complete one full matrix multiplication
-    tflops_per_gpu = calculate_tflops(matrix_size, avg_total_time * world_size, num_ops=1)
+    # The effective TFLOPS is for the complete operation including communication
+    # Total FLOPs for the full matrix multiplication divided by total time (including communication)
+    tflops_per_gpu = calculate_tflops(matrix_size, avg_total_time, num_ops=1) / world_size
+    
+    if rank == 0 and num_iterations > 0:
+        print(f"    Compute time: {avg_compute_time*1000:.3f} ms, Comm time: {avg_comm_time*1000:.3f} ms")
     
     return avg_total_time, tflops_per_gpu
+
+def validate_result(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor, 
+                    tolerance: float = 1e-3) -> bool:
+    """Validate matrix multiplication result by checking a small portion"""
+    # Check just a few elements to avoid overhead
+    sample_size = min(10, A.shape[0])
+    C_check = torch.matmul(A[:sample_size, :sample_size], B[:sample_size, :sample_size])
+    C_actual = C[:sample_size, :sample_size]
+    relative_error = torch.abs(C_actual - C_check) / (torch.abs(C_check) + 1e-8)
+    max_error = relative_error.max().item()
+    return max_error < tolerance
 
 def run_benchmarks(rank: int, world_size: int, matrix_sizes: List[int], 
                    dtype: torch.dtype, mode: ScalingMode, 
@@ -312,6 +384,14 @@ def main():
                 props = torch.cuda.get_device_properties(i)
                 print(f"    Memory: {props.total_memory / (1024**3):.2f} GB")
                 print(f"    SMs: {props.multi_processor_count}")
+    
+    # Verify collectives are working before running benchmarks
+    device = f'cuda:{rank % torch.cuda.device_count()}'
+    if world_size > 1 and not verify_collectives(rank, world_size, device):
+        if rank == 0:
+            print("ERROR: Collective operations verification failed!")
+        cleanup_distributed()
+        return
     
     try:
         run_benchmarks(rank, world_size, args.sizes, dtype, mode, args.iterations, args.warmup)
