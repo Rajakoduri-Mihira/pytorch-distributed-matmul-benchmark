@@ -10,7 +10,17 @@ def setup_distributed():
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
         rank = int(os.environ['RANK'])
         world_size = int(os.environ['WORLD_SIZE'])
-        dist.init_process_group(backend='nccl')
+
+        # Detect if using AMD GPU (ROCm) and use appropriate backend
+        backend = 'nccl'
+        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+            device_name = torch.cuda.get_device_name(0).lower()
+            if 'radeon' in device_name or 'amd' in device_name:
+                backend = 'gloo'
+                if rank == 0:
+                    print(f"Detected AMD GPU ({torch.cuda.get_device_name(0)}), using GLOO backend")
+
+        dist.init_process_group(backend=backend)
         torch.cuda.set_device(rank % torch.cuda.device_count())
         return rank, world_size
     else:
@@ -99,12 +109,13 @@ def run_benchmarks(rank: int, world_size: int, matrix_sizes: List[int],
             
             tflops_tensor = torch.tensor([tflops], device=device)
             time_tensor = torch.tensor([avg_time], device=device)
-            
+
             if dist.is_initialized():
                 dist.all_reduce(tflops_tensor, op=dist.ReduceOp.SUM)
-                dist.all_reduce(time_tensor, op=dist.ReduceOp.AVG)
+                # GLOO backend doesn't support AVG, so use SUM and divide
+                dist.all_reduce(time_tensor, op=dist.ReduceOp.SUM)
                 total_tflops = tflops_tensor.item()
-                avg_time_global = time_tensor.item()
+                avg_time_global = time_tensor.item() / world_size
             else:
                 total_tflops = tflops
                 avg_time_global = avg_time
@@ -115,8 +126,19 @@ def run_benchmarks(rank: int, world_size: int, matrix_sizes: List[int],
                 print(f"  - TFLOPS per GPU: {tflops:.2f}")
                 print(f"  - Total TFLOPS (all GPUs): {total_tflops:.2f}")
                 print(f"  - Required FLOPs per operation: {2.0 * size**3 / 1e12:.2f} TFLOPs")
-                # RTX 6000 Ada has ~91.1 TFLOPS FP32 theoretical peak
-                print(f"  - GPU Efficiency: {(tflops / 91.1) * 100:.1f}% of theoretical peak")
+
+                # Detect GPU type for efficiency calculation
+                device_name = torch.cuda.get_device_name(0).lower()
+                if 'radeon' in device_name or 'amd' in device_name:
+                    # AMD Radeon RX 7900 XTX has ~123 TFLOPS FP16/BF16 theoretical peak
+                    theoretical_peak = 123.0 if dtype != torch.float32 else 61.4
+                    gpu_name = "Radeon RX 7900 XTX"
+                else:
+                    # RTX 6000 Ada has ~91.1 TFLOPS FP32 theoretical peak
+                    theoretical_peak = 91.1 if dtype == torch.float32 else 182.2
+                    gpu_name = "RTX 6000 Ada"
+
+                print(f"  - GPU Efficiency: {(tflops / theoretical_peak) * 100:.1f}% of {gpu_name} theoretical peak")
                 
         except torch.cuda.OutOfMemoryError:
             if rank == 0:
